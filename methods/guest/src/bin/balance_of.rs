@@ -56,7 +56,6 @@ fn main() {
     let returns = Contract::new(contract, &env).call_builder(&call).call();
     println!("Balance of account: {:?}", returns._0);
 
-
     // Check if the account has the required amount.
     assert!(returns._0 == amount, "Insufficient balance");
 
