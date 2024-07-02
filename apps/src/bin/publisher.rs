@@ -16,62 +16,22 @@
 // to the Bonsai proving service and publish the received proofs directly
 // to your deployed app contract.
 
-use alloy_primitives::U256;
-use alloy_sol_types::{sol, SolInterface, SolValue};
-use anyhow::{Context, Result};
+use alloy_primitives::{Address, U256};
+use alloy_sol_types::{sol, SolCall};
+use anyhow::Result;
+use apps::TxSender;
+// use bonsai_sdk::alpha as bonsai_sdk;
 use clap::Parser;
-use ethers::prelude::*;
-use methods::IS_EVEN_ELF;
-use risc0_ethereum_contracts::groth16;
+use methods::BALANCE_OF_ELF;
+use risc0_ethereum_contracts::groth16::encode;
+// use risc0_groth16::Seal;
+use risc0_steel::{config::ETH_SEPOLIA_CHAIN_SPEC, ethereum::EthEvmEnv, Contract, EvmBlockHeader};
 use risc0_zkvm::{default_prover, ExecutorEnv, ProverOpts, VerifierContext};
+// use std::fs::File;
+// use std::io::BufReader;
+use tracing_subscriber::EnvFilter;
 
-// `IEvenNumber` interface automatically generated via the alloy `sol!` macro.
-sol! {
-    interface IEvenNumber {
-        function set(uint256 x, bytes calldata seal);
-    }
-}
-
-/// Wrapper of a `SignerMiddleware` client to send transactions to the given
-/// contract's `Address`.
-pub struct TxSender {
-    chain_id: u64,
-    client: SignerMiddleware<Provider<Http>, Wallet<k256::ecdsa::SigningKey>>,
-    contract: Address,
-}
-
-impl TxSender {
-    /// Creates a new `TxSender`.
-    pub fn new(chain_id: u64, rpc_url: &str, private_key: &str, contract: &str) -> Result<Self> {
-        let provider = Provider::<Http>::try_from(rpc_url)?;
-        let wallet: LocalWallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
-        let client = SignerMiddleware::new(provider.clone(), wallet.clone());
-        let contract = contract.parse::<Address>()?;
-
-        Ok(TxSender {
-            chain_id,
-            client,
-            contract,
-        })
-    }
-
-    /// Send a transaction with the given calldata.
-    pub async fn send(&self, calldata: Vec<u8>) -> Result<Option<TransactionReceipt>> {
-        let tx = TransactionRequest::new()
-            .chain_id(self.chain_id)
-            .to(self.contract)
-            .from(self.client.address())
-            .data(calldata);
-
-        log::info!("Transaction request: {:?}", &tx);
-
-        let tx = self.client.send_transaction(tx, None).await?.await?;
-
-        log::info!("Transaction receipt: {:?}", &tx);
-
-        Ok(tx)
-    }
-}
+sol!("../contracts/ICounter.sol");
 
 /// Arguments of the publisher CLI.
 #[derive(Parser, Debug)]
@@ -86,72 +46,111 @@ struct Args {
     eth_wallet_private_key: String,
 
     /// Ethereum Node endpoint.
-    #[clap(long)]
+    #[clap(long, env)]
     rpc_url: String,
 
-    /// Application's contract address on Ethereum
+    /// Counter's contract address on Ethereum
     #[clap(long)]
-    contract: String,
+    contract: Address,
 
-    /// The input to provide to the guest binary
-    #[clap(short, long)]
-    input: U256,
+    /// Account address to read the balance_of on Ethereum
+    #[clap(long)]
+    account: Address,
+
+    // Amount that the account should have
+    #[clap(long)]
+    amount: U256,
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
-    // Parse CLI Arguments: The application starts by parsing command-line arguments provided by the user.
+    // Initialize tracing. In order to view logs, run `RUST_LOG=info cargo run`
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    // parse the command line arguments
     let args = Args::parse();
 
-    // Create a new transaction sender using the parsed arguments.
-    let tx_sender = TxSender::new(
-        args.chain_id,
-        &args.rpc_url,
-        &args.eth_wallet_private_key,
-        &args.contract,
-    )?;
+    // Create an EVM environment from an RPC endpoint and a block number. If no block number is
+    // provided, the latest block is used.
+    let mut env = EthEvmEnv::from_rpc(&args.rpc_url, None)?;
+    //  The `with_chain_spec` method is used to specify the chain configuration.
+    env = env.with_chain_spec(&ETH_SEPOLIA_CHAIN_SPEC);
 
-    // ABI encode input: Before sending the proof request to the Bonsai proving service,
-    // the input number is ABI-encoded to match the format expected by the guest code running in the zkVM.
-    let input = args.input.abi_encode();
+    // // Prepare the function call
+    // let call = IERC20::balanceOfCall {
+    //     account: args.account,
+    // };
 
-    let env = ExecutorEnv::builder().write_slice(&input).build()?;
+    let call = ICounter::balanceOfCall {
+        account: args.account,
+    };
+    // Preflight the call to execute the function in the guest.
+    let mut contract = Contract::preflight(args.contract, &mut env);
+    let returns = contract.call_builder(&call).call()?;
+    println!(
+        "For block {} calling `{}` on {} returns: {}",
+        env.header().number(),
+        ICounter::balanceOfCall::SIGNATURE,
+        args.contract,
+        returns._0
+    );
+
+    println!("proving...");
+    let view_call_input = env.into_input()?;
+    let env = ExecutorEnv::builder()
+        .write(&view_call_input)?
+        .write(&args.contract)?
+        .write(&args.account)?
+        .write(&args.amount)?
+        .build()?;
 
     let receipt = default_prover()
         .prove_with_ctx(
             env,
             &VerifierContext::default(),
-            IS_EVEN_ELF,
+            BALANCE_OF_ELF,
             &ProverOpts::groth16(),
         )?
         .receipt;
+    println!("proving...done");
 
-    // Encode the seal with the selector.
-    let seal = groth16::encode(receipt.inner.groth16()?.seal.clone())?;
-
-    // Extract the journal from the receipt.
+    // Create a new `TxSender`.
+    let tx_sender = TxSender::new(
+        args.chain_id,
+        &args.rpc_url,
+        &args.eth_wallet_private_key,
+        &args.contract.to_string(),
+    )?;
+    // Encode the groth16 seal with the selector
+    let seal = encode(receipt.inner.groth16()?.seal.clone())?;
     let journal = receipt.journal.bytes.clone();
-
-    // Decode Journal: Upon receiving the proof, the application decodes the journal to extract
-    // the verified number. This ensures that the number being submitted to the blockchain matches
-    // the number that was verified off-chain.
-    let x = U256::abi_decode(&journal, true).context("decoding journal data")?;
-
-    // Construct function call: Using the IEvenNumber interface, the application constructs
-    // the ABI-encoded function call for the set function of the EvenNumber contract.
-    // This call includes the verified number, the post-state digest, and the seal (proof).
-    let calldata = IEvenNumber::IEvenNumberCalls::set(IEvenNumber::setCall {
-        x,
+    // Encode the function call for `ICounter.verify(journal, seal)`.
+    let calldata = ICounter::verifyCall {
+        journalData: journal.into(),
         seal: seal.into(),
-    })
+    }
     .abi_encode();
 
-    // Initialize the async runtime environment to handle the transaction sending.
-    let runtime = tokio::runtime::Runtime::new()?;
+    // Proof with the snark receipt
+    // --------------------------------
+    // let snark_receipt_raw = include_str!("../../snark.json");
+    // let snark_receipt: bonsai_sdk::responses::SnarkReceipt =
+    //     serde_json::from_str(snark_receipt_raw)?;
+    // let calldata = ICounter::incrementCall {
+    //     journalData: snark_receipt.journal.into(),
+    //     seal: encode(snark_receipt.snark.to_vec().into())?.into(),
+    // }
+    // .abi_encode();
+    // println!("{:?}", calldata);
+    // --------------------------------
 
-    // Send transaction: Finally, the TxSender component sends the transaction to the Ethereum blockchain,
-    // effectively calling the set function of the EvenNumber contract with the verified number and proof.
+    // Encode the function call for `ICounter.increment(journal, seal)`.
+    // Send the calldata to Ethereum.
+    println!("sending tx...");
+    let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(tx_sender.send(calldata))?;
+    println!("sending tx...done");
 
     Ok(())
 }

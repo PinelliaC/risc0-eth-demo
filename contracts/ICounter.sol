@@ -1,4 +1,4 @@
-// Copyright 2023 RISC Zero, Inc.
+// Copyright 2024 RISC Zero, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,6 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
 
-//! Generated crate containing the image ID and ELF binary of the build guest.
-include!(concat!(env!("OUT_DIR"), "/methods.rs"));
+pragma solidity ^0.8.20;
+
+interface ICounter {
+    function balanceOf(address account) external view returns (uint);
+
+    function withdraw(uint256 amount) external;
+
+    function verify(bytes calldata journalData, bytes calldata seal) external;
+
+    function checkVerified(address account) external view returns (bool);
+}
